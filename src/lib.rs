@@ -5,6 +5,7 @@ extern crate crossbeam_channel as channel;
 extern crate log;
 
 use std::cmp;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -34,7 +35,7 @@ where
     Res: Send + Sync + 'static,
 {
     context: Ctx,
-    sender: Sender<(Element, Sender<Res>)>,
+    sender: ManuallyDrop<Sender<(Element, Sender<Res>)>>,
     receiver: Receiver<(Element, Sender<Res>)>,
     worker_func: Lambda,
     num_workers: Arc<AtomicUsize>,
@@ -64,6 +65,27 @@ where
     }
 }
 
+/// We implement Drop to ensure that the WorkerPool finishes all assigned work.
+impl<Ctx, Lambda, Element, Res> Drop for WorkerPool<Ctx, Lambda, Element, Res>
+where
+    Ctx: Clone + Send + Sync + 'static,
+    Lambda: Fn(Ctx, Element) -> Res + Clone + Send + 'static,
+    Element: Send + Sync + 'static,
+    Res: Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        // if we're in `drop`, then we're the last code with access to this
+        // particular `sender: Sender`, so this manual drop is safe.
+        // it's necessary to drop this sender, otherwise the workers will never exit.
+        unsafe {
+            ManuallyDrop::drop(&mut self.sender);
+        }
+        while self.num_workers.load(Ordering::SeqCst) > 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 impl<Ctx, Lambda, Element, Res> WorkerPool<Ctx, Lambda, Element, Res>
 where
     Ctx: Clone + Send + Sync + 'static,
@@ -80,9 +102,10 @@ where
         let min_workers = min_workers.into();
         let max_workers = max_workers.into();
 
-        let (sender, receiver) = channel::bounded(POOL_QUEUE_CAP);
-        let num_workers = Arc::new(AtomicUsize::new(0));
         let min_workers = cmp::max(1, min_workers.unwrap_or(1));
+        let num_workers = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = channel::bounded(POOL_QUEUE_CAP);
+        let sender = ManuallyDrop::new(sender);
 
         let pool = WorkerPool {
             context,
@@ -94,13 +117,15 @@ where
             max_workers,
         };
 
+        // create copies for the supervisor task
         let min_workers = pool.min_workers;
         let max_workers = pool.max_workers;
         let num_workers = pool.num_workers.clone();
         let receiver = pool.receiver.clone();
         let worker_func = pool.worker_func.clone();
         let context = pool.context.clone();
-        //launch the supervisor task
+
+        // launch the supervisor task
         thread::spawn(move || {
             // spawn the minimum workers
             for _ in 0..min_workers {
@@ -152,7 +177,7 @@ where
                             sender.send(res);
                         },
                         None => {
-                            // sender has been dropped
+                            // last sender has been dropped and message queue is now empty
                             let cur_workers = num_workers.fetch_sub(1, Ordering::SeqCst);
                             debug!("end of xenon worker pool, {} left.", cur_workers - 1);
                             break;
@@ -174,6 +199,7 @@ where
         });
     }
 
+    /// submit returns a Receiver that will receive exactly 1 result when the element has been processed
     pub fn submit(&self, element: Element) -> Receiver<Res> {
         let (sender, receiver) = channel::bounded(1);
         self.sender.send((element, sender));
